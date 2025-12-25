@@ -24,17 +24,21 @@ ViralFlip detects **pre-symptomatic illness** by analyzing subtle changes in you
 | **72h Risk** | Probability of illness onset in next 72 hours |
 | **Virus Type** | Classification: COVID, Flu, Cold, RSV, Pneumonia, or General |
 | **Confidence** | How confident the model is in its prediction |
+| **Uncertainty** | Aleatoric and epistemic uncertainty estimates |
 
 ### Example Prediction
 
 ```python
-{
-    "risks": {24: 0.42, 48: 0.65, 72: 0.78},
-    "virus_prediction": "Influenza",
-    "virus_confidence": 0.73,
-    "drift_scores": {"voice": 1.8, "cough": 2.1, "rppg": 1.5}
-}
-# Interpretation: 78% chance of flu in 72h, detected via voice/cough changes
+from viralflip import ViralFlip
+
+model = ViralFlip(feature_dims={"voice": 30, "cough": 30, "rppg": 5})
+output = model.predict(drift_dict={"voice": voice_features, "cough": cough_features})
+
+print(output.risks)           # {24: 0.42, 48: 0.65, 72: 0.78}
+print(output.virus_prediction)  # "Influenza"
+print(output.should_alert)      # True
+print(output.get_illness_summary())
+# "Risk: 78% chance of illness in 72h | Likely: Influenza (73% conf) | ALERT"
 ```
 
 ---
@@ -47,8 +51,9 @@ ViralFlip detects **pre-symptomatic illness** by analyzing subtle changes in you
 | 📱 **Passive Sensing** | Uses voice, cough, heart rate, gait, activity from phone sensors |
 | 🧬 **Personal Baselines** | Learns what's "normal" for YOU, detects deviations |
 | 🛡️ **Behavior Debiasing** | Removes false signals from travel, sleep changes, etc. |
+| 🎯 **Conformal Prediction** | Calibrated uncertainty with coverage guarantees |
+| 🔬 **Pretrained Encoder** | Optional transformer encoder for robust representations |
 | ⚡ **GPU Optimized** | Mixed precision, gradient accumulation for fast training |
-| 🔬 **Real Data Only** | Trained on actual health datasets with verified illness labels |
 
 ---
 
@@ -74,57 +79,163 @@ source venv/bin/activate  # Windows: venv\Scripts\activate
 pip install -e ".[dev]"
 ```
 
-### Train the Model (One Command)
+### Train the Model
 
 ```bash
-python scripts/train_max_accuracy.py
+# One command training
+python scripts/train.py --max-accuracy
 ```
 
 This will:
-1. ✅ Download real health datasets (~5GB)
-2. ✅ Extract audio features (MFCCs, spectral)
-3. ✅ Train with optimized GPU settings
-4. ✅ Save the best model
+1. ✅ Load processed health datasets
+2. ✅ Train with optimized GPU settings
+3. ✅ Save the best model to `runs/`
 
-### Or Step-by-Step
+### Check Model Accuracy
 
 ```bash
-# Step 1: Download real health datasets
-python scripts/download_more_data.py --health --parallel 4
+# Evaluate on validation set
+python scripts/check_accuracy.py --model runs/YOUR_RUN/best_model.pt
 
-# Step 2: Prepare data for training
-python scripts/prepare_real_data.py
-
-# Step 3: Train the model
-python scripts/train.py --max-accuracy
+# Auto-find latest model
+python scripts/check_accuracy.py --split test
 ```
 
 ---
 
-## Real Health Datasets
+## Using a Trained Model
 
-ViralFlip trains on **real data with verified illness labels** - no synthetic data!
+```python
+import torch
+import numpy as np
+from viralflip import ViralFlip
 
-| Dataset | Samples | Labels | Description |
-|---------|---------|--------|-------------|
-| **COUGHVID** | 25,000+ | COVID | Coughs with PCR test results |
-| **Coswara** | 10,000+ | COVID | Breathing, cough, voice recordings |
-| **Virufy** | 1,500+ | COVID | PCR-confirmed COVID coughs |
-| **DiCOVA** | 2,000+ | COVID/Resp | Respiratory illness challenge data |
-| **FluSense** | 5,000+ | Flu | Hospital waiting room audio |
-| **Sound-Dr** | 1,000+ | Pneumonia | Respiratory sound analysis |
+# 1. Create model with same settings as training
+model = ViralFlip(
+    feature_dims={"voice": 30, "cough": 30, "rppg": 5},
+    horizons=[24, 48, 72],
+    use_virus_classifier=True,
+)
 
-### Download Health Datasets
+# 2. Load trained weights
+checkpoint = torch.load("runs/best_model.pt", map_location="cpu")
+model.load_state_dict(checkpoint["model_state_dict"])
+model.eval()
 
-```bash
-# Download all health datasets
-python scripts/download_more_data.py --health --parallel 4
+# 3. Make predictions
+output = model.predict(
+    drift_dict={
+        "voice": np.random.randn(5, 30),  # (seq_len, features)
+        "cough": np.random.randn(5, 30),
+    },
+    quality_scores={"voice": 0.9, "cough": 0.85},
+    user_id="user_123",
+)
 
-# List available datasets
-python scripts/download_more_data.py --list
+# 4. Access results
+print(f"24h Risk: {output.risks[24]:.1%}")
+print(f"72h Risk: {output.risks[72]:.1%}")
+print(f"Virus: {output.virus_prediction} ({output.virus_confidence:.0%})")
+print(f"Alert: {output.should_alert}")
+print(f"Uncertainty: {output.aleatoric_uncertainty:.2f}")
+```
 
-# Download specific dataset
-python scripts/download_more_data.py --dataset coughvid
+### Output Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `risks` | `dict[int, float]` | Risk probability per horizon |
+| `confidences` | `dict[int, float]` | Confidence per horizon |
+| `virus_prediction` | `str` | Predicted illness type |
+| `virus_confidence` | `float` | Confidence in virus type |
+| `should_alert` | `bool` | Whether to trigger alert |
+| `drift_scores` | `dict[str, float]` | Per-modality drift scores |
+| `aleatoric_uncertainty` | `float` | Data uncertainty |
+| `epistemic_uncertainty` | `float` | Model uncertainty |
+| `conformal_lower` | `dict` | Lower confidence bounds |
+| `conformal_upper` | `dict` | Upper confidence bounds |
+
+---
+
+## Model Architecture
+
+```
+Phone Sensors → Feature Extraction → Personal Baseline Memory
+                                            ↓
+                              ┌─────────────────────────────┐
+                              │   Drift Score Module (φ)    │
+                              │  [Optional: Encoder-backed] │
+                              └─────────────────────────────┘
+                                            ↓
+                              ┌─────────────────────────────┐
+                              │  Behavior-Drift Debiasing   │
+                              └─────────────────────────────┘
+                                            ↓
+                              ┌─────────────────────────────┐
+                              │   Lag-Lattice Hazard Model  │
+                              │   + Interaction Module      │
+                              └─────────────────────────────┘
+                                     ↙           ↘
+                    ┌────────────────────┐  ┌────────────────────┐
+                    │  Risk Prediction   │  │  Virus Classifier  │
+                    │   (24/48/72h)      │  │    (7 classes)     │
+                    └────────────────────┘  └────────────────────┘
+                              ↓                       ↓
+                    ┌────────────────────┐  ┌────────────────────┐
+                    │ Conformal Bounds   │  │  Uncertainty Est.  │
+                    └────────────────────┘  └────────────────────┘
+```
+
+### Core Components
+
+| Component | Purpose |
+|-----------|---------|
+| **ViralFlip** | Unified model combining all features |
+| **DriftScoreModule** | Compresses modality drifts to scalar scores |
+| **LagLatticeHazardModel** | Multi-horizon prediction with temporal structure |
+| **InteractionModule** | Captures modality correlations (voice+cough) |
+| **VirusClassifier** | MLP head for illness type classification |
+| **ConfidenceScorer** | Data quality-based confidence |
+| **PersonalizationLayer** | Per-user calibration |
+
+---
+
+## Project Structure
+
+```
+viralflip/
+├── configs/
+│   └── high_performance.yaml    # GPU-optimized training config
+├── src/viralflip/
+│   ├── model/
+│   │   ├── viralflip.py         # Unified ViralFlip model
+│   │   ├── drift_score.py       # Drift score compression
+│   │   ├── lag_lattice.py       # Multi-horizon hazard model
+│   │   ├── interactions.py      # Modality interactions
+│   │   ├── personalization.py   # Per-user calibration
+│   │   └── virus_types.py       # Virus type definitions
+│   ├── data/
+│   │   ├── dataset.py           # PyTorch dataset
+│   │   └── real_data_loader.py  # Health dataset loaders
+│   ├── train/
+│   │   ├── trainer.py           # Training loop
+│   │   ├── losses.py            # Focal loss + virus classification
+│   │   └── build_sequences.py   # Sequence construction
+│   ├── baseline/                # Personal Baseline Memory
+│   ├── debias/                  # Behavior-Drift Debiasing
+│   ├── pretrain/                # Masked autoencoder pretraining
+│   ├── conformal/               # Conformal prediction
+│   ├── explain/                 # Explainability engine
+│   └── eval/                    # Metrics, calibration
+├── scripts/
+│   ├── train.py                 # Main training script
+│   ├── check_accuracy.py        # Evaluate model accuracy
+│   ├── train_viralflip_x.py     # Advanced training with pretraining
+│   ├── evaluate.py              # Full evaluation pipeline
+│   └── download_more_data.py    # Download health datasets
+├── tests/                       # Unit tests
+└── data/
+    └── processed/               # Training-ready data
 ```
 
 ---
@@ -142,36 +253,9 @@ python scripts/download_more_data.py --dataset coughvid
 
 ---
 
-## Model Architecture
-
-```
-Phone Sensors → Feature Extraction → Personal Baseline Memory
-                                            ↓
-                                    Drift Score (φ)
-                                            ↓
-                              Behavior-Drift Debiasing
-                                            ↓
-                                    Lag-Lattice Model
-                                     ↙           ↘
-                            Risk Prediction    Virus Classifier
-                            (24/48/72h)        (7 classes)
-```
-
-### Components
-
-| Component | Purpose |
-|-----------|---------|
-| **Personal Baseline Memory (PBM)** | Tracks your individual "healthy" baseline |
-| **Behavior-Drift Debiasing (BDD)** | Removes confounds from travel, sleep changes |
-| **Lag-Lattice Hazard Model** | Multi-horizon prediction with temporal structure |
-| **Interaction Module** | Captures modality correlations (voice+cough, etc.) |
-| **Virus Classifier** | MLP head for illness type classification |
-
----
-
 ## Configuration
 
-High-performance config for GPU training (`configs/high_performance.yaml`):
+High-performance config (`configs/high_performance.yaml`):
 
 ```yaml
 training:
@@ -182,49 +266,16 @@ training:
   use_amp: true  # Mixed precision (FP16)
 
 model:
-  max_lag_bins: 16  # 96h lookback
+  max_lag_bins: 16           # 96h lookback
   use_interactions: true
   use_virus_classifier: true
+  use_encoder: false         # Set true for pretrained encoder
   virus_classifier:
     hidden_dim: 128
-    n_classes: 7  # HEALTHY + 6 illness types
+    n_classes: 7
 
 data:
-  horizons: [24, 48, 72]  # Prediction windows
-```
-
----
-
-## Project Structure
-
-```
-viralflip/
-├── configs/
-│   └── high_performance.yaml    # GPU-optimized training config
-├── src/viralflip/
-│   ├── data/
-│   │   ├── real_data_loader.py  # Loads health datasets
-│   │   └── dataset.py           # PyTorch dataset
-│   ├── model/
-│   │   ├── viralflip.py         # Main unified model
-│   │   ├── virus_types.py       # Virus type definitions
-│   │   ├── drift_score.py       # Drift score compression
-│   │   └── lag_lattice.py       # Multi-horizon hazard model
-│   ├── train/
-│   │   ├── trainer.py           # Training loop with multi-task loss
-│   │   ├── losses.py            # Focal loss + virus classification
-│   │   └── build_sequences.py   # Sequence construction
-│   ├── features/                # Feature extractors per modality
-│   ├── baseline/                # Personal Baseline Memory
-│   ├── debias/                  # Behavior-Drift Debiasing
-│   └── eval/                    # Metrics, calibration
-├── scripts/
-│   ├── train_max_accuracy.py    # One-command training pipeline
-│   ├── train.py                 # Main training script
-│   ├── prepare_real_data.py     # Process downloaded datasets
-│   └── download_more_data.py    # Download health datasets
-└── data/
-    └── processed/               # Training-ready data
+  horizons: [24, 48, 72]
 ```
 
 ---
@@ -236,10 +287,7 @@ viralflip/
 | RTX 3060 | 12GB | 64 | ~4 hours |
 | RTX 3080 | 10GB | 96 | ~2.5 hours |
 | RTX 4090 | 24GB | 256 | ~1 hour |
-| RTX 5070 | 12GB | 128 | ~2 hours |
 | A100 | 40GB | 512 | ~30 min |
-
-For cloud training, we recommend [Vast.ai](https://vast.ai) or [Lambda Labs](https://lambdalabs.com).
 
 ---
 
@@ -254,29 +302,60 @@ For cloud training, we recommend [Vast.ai](https://vast.ai) or [Lambda Labs](htt
 
 ---
 
-## API Usage
+## Advanced Features
+
+### Pretrained Encoder Mode
 
 ```python
-from viralflip import ViralFlip, VirusType, VIRUS_NAMES
-import torch
+from viralflip import ViralFlip, MultimodalTimeSeriesEncoder
 
-# Load trained model
+# Create encoder
+encoder = MultimodalTimeSeriesEncoder(
+    modality_dims={"voice": 30, "cough": 30},
+    embed_dim=128,
+    n_layers=4,
+)
+
+# Use encoder-backed model
 model = ViralFlip(
-    feature_dims={"voice": 30, "cough": 30, "rppg": 5},
-    use_virus_classifier=True,
+    feature_dims={"voice": 30, "cough": 30},
+    use_encoder=True,
+    encoder=encoder,
+    encoder_embed_dim=128,
 )
-model.load_state_dict(torch.load("runs/best_model.pt")["model_state_dict"])
-model.eval()
+```
 
-# Make prediction
-output = model.predict(
-    drift_dict={"voice": voice_features, "cough": cough_features},
-    quality_scores={"voice": 0.9, "cough": 0.8},
+### Conformal Prediction
+
+```python
+# Calibrate conformal predictor
+model.calibrate_conformal(
+    calibration_predictions={24: preds_24, 48: preds_48, 72: preds_72},
+    calibration_labels={24: labels_24, 48: labels_48, 72: labels_72},
 )
 
-print(f"72h Risk: {output.risks[72]:.1%}")
-print(f"Likely illness: {output.virus_prediction}")
-print(f"Confidence: {output.virus_confidence:.1%}")
+# Get prediction with uncertainty bounds
+output = model.predict(drift_dict)
+print(output.conformal_lower)  # {24: 0.35, 48: 0.55, 72: 0.68}
+print(output.conformal_upper)  # {24: 0.49, 48: 0.75, 72: 0.88}
+```
+
+### Explainability
+
+```python
+from viralflip.explain import ExplanationEngine
+
+engine = ExplanationEngine(model, top_k=5)
+explanation = engine.explain(drift_dict, horizon=72)
+
+print(explanation.summary_text())
+# Risk (72h horizon): 78.2% (confidence: 85.3%)
+# 
+# Top Contributors:
+#   1. voice (current): score=2.14, Δ=-15.3%
+#        - f0_mean: z=2.8
+#        - jitter: z=2.1
+#   2. cough (current): score=1.87, Δ=-12.1%
 ```
 
 ---
@@ -286,6 +365,62 @@ print(f"Confidence: {output.virus_confidence:.1%}")
 ```bash
 pytest tests/ -v
 pytest tests/ --cov=src/viralflip --cov-report=html
+```
+
+---
+
+## API Reference
+
+### ViralFlip
+
+```python
+ViralFlip(
+    feature_dims: dict[str, int],      # Modality -> feature dimension
+    horizons: list[int] = [24, 48, 72],
+    max_lag: int = 12,
+    
+    # Encoder options
+    use_encoder: bool = False,
+    encoder: nn.Module = None,
+    encoder_embed_dim: int = 128,
+    
+    # Regularization
+    l1_lambda_drift: float = 0.01,
+    l1_lambda_lattice: float = 0.01,
+    
+    # Features
+    use_interactions: bool = False,
+    use_personalization: bool = True,
+    use_virus_classifier: bool = True,
+    use_conformal: bool = True,
+    use_environment_detection: bool = True,
+)
+```
+
+### ViralFlipOutput
+
+```python
+@dataclass
+class ViralFlipOutput:
+    risks: dict[int, float]           # horizon -> probability
+    confidences: dict[int, float]     # horizon -> confidence
+    raw_logits: dict[int, float]
+    drift_scores: dict[str, float]    # modality -> score
+    
+    # Virus classification
+    virus_probs: dict[str, float]     # virus_name -> probability
+    virus_prediction: str             # Most likely virus
+    virus_confidence: float
+    
+    # Uncertainty
+    conformal_lower: dict[int, float]
+    conformal_upper: dict[int, float]
+    aleatoric_uncertainty: float
+    epistemic_uncertainty: float
+    
+    # Alerting
+    should_alert: bool
+    alert_confidence: float
 ```
 
 ---
@@ -310,4 +445,4 @@ MIT License - see LICENSE file.
 
 ## Acknowledgments
 
-Built on research in mobile health sensing and digital biomarkers. Thanks to the creators of COUGHVID, Coswara, Virufy, DiCOVA, FluSense, and other public health datasets that make this research possible.
+Built on research in mobile health sensing and digital biomarkers. Thanks to the creators of COUGHVID, Coswara, Virufy, DiCOVA, FluSense, and other public health datasets.
